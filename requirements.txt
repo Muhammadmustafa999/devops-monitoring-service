@@ -1,0 +1,6 @@
+# DevOps Monitoring Service
+# Internal platform v1.3.0
+
+Django==4.1.0
+requests==2.28.0
+redis==4.3.0
