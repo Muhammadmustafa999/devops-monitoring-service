@@ -1,0 +1,141 @@
+name: ExposureIQ Security Scan
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  full-security-scan:
+    runs-on: ubuntu-latest
+    name: Trivy CVE + Secure Coding Analysis
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Run Trivy CVE Scan
+        run: |
+          trivy fs . --format json --output trivy-results.json --exit-code 0
+
+      - name: Upload CVE Results to ExposureIQ
+        env:
+          THREATINTEL_TOKEN: ${{ secrets.THREATINTEL_TOKEN }}
+          THREATINTEL_API_URL: ${{ secrets.THREATINTEL_API_URL }}
+        run: |
+          python3 -c "
+          import json, urllib.request, os
+
+          with open('trivy-results.json') as f:
+              trivy_data = json.load(f)
+
+          payload = json.dumps({
+              'repo_name': '${{ github.event.repository.name }}',
+              'branch': '${{ github.ref_name }}',
+              'commit_sha': '${{ github.sha }}',
+              'trivy_results': trivy_data
+          }).encode('utf-8')
+
+          req = urllib.request.Request(
+              os.environ['THREATINTEL_API_URL'] + '/api/scan/upload/',
+              data=payload,
+              headers={
+                  'Authorization': 'Token ' + os.environ['THREATINTEL_TOKEN'],
+                  'Content-Type': 'application/json'
+              }
+          )
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              result = json.loads(r.read().decode())
+              print(f'CVEs Found: {result.get(\"total_vulnerabilities\", 0)}')
+              print(f'Policy: {result.get(\"policy_status\", \"unknown\")}')
+          except urllib.error.HTTPError as e:
+              print(f'Error: {e.code} - {e.read().decode()}')
+          except Exception as e:
+              print(f'Warning: {e}')
+          "
+
+      - name: Collect Code Files
+        run: |
+          python3 -c "
+          import os, json
+
+          ALLOWED_EXT = {'.py','.js','.ts','.yml','.yaml','.sh'}
+          SKIP_DIRS = {'.git','node_modules','venv','__pycache__'}
+
+          files = []
+          for root, dirs, names in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+              for name in names:
+                  if len(files) >= 30: break
+                  _, ext = os.path.splitext(name)
+                  if ext.lower() not in ALLOWED_EXT: continue
+                  path = os.path.join(root, name)
+                  try:
+                      if os.path.getsize(path) > 50000: continue
+                      with open(path, 'r', errors='ignore') as f:
+                          content = f.read()
+                      if content.strip():
+                          files.append({
+                              'name': path.lstrip('./'),
+                              'content': content,
+                              'language': 'auto'
+                          })
+                  except: continue
+
+          print(f'Collected {len(files)} files')
+          with open('code-files.json','w') as f:
+              json.dump(files, f)
+          "
+
+      - name: Upload Code Check to ExposureIQ
+        env:
+          THREATINTEL_TOKEN: ${{ secrets.THREATINTEL_TOKEN }}
+          THREATINTEL_API_URL: ${{ secrets.THREATINTEL_API_URL }}
+        run: |
+          python3 -c "
+          import json, sys, urllib.request, os
+
+          with open('code-files.json') as f:
+              files = json.load(f)
+
+          if not files:
+              print('No files to check')
+              sys.exit(0)
+
+          payload = json.dumps({
+              'repo_name': '${{ github.event.repository.name }}',
+              'branch': '${{ github.ref_name }}',
+              'commit_sha': '${{ github.sha }}',
+              'files': files
+          }).encode('utf-8')
+
+          req = urllib.request.Request(
+              os.environ['THREATINTEL_API_URL'] + '/api/scan/code-check/',
+              data=payload,
+              headers={
+                  'Authorization': 'Token ' + os.environ['THREATINTEL_TOKEN'],
+                  'Content-Type': 'application/json'
+              }
+          )
+          try:
+              r = urllib.request.urlopen(req, timeout=60)
+              result = json.loads(r.read().decode())
+              print(f'Compliance Score: {result.get(\"compliance_score\", 0)}%')
+              print(f'Total Findings: {result.get(\"total_findings\", 0)}')
+              print(f'Critical: {result.get(\"critical_findings\", 0)}')
+              if result.get('should_block'):
+                  print(f'BLOCKED: {result.get(\"block_reason\", \"\")}')
+                  sys.exit(1)
+              else:
+                  print('Secure coding check PASSED')
+          except urllib.error.HTTPError as e:
+              print(f'Error: {e.code} - {e.read().decode()}')
+          except Exception as e:
+              print(f'Warning: {e}')
+          "
